@@ -72,15 +72,21 @@ class Paratrooper(Optimizer):
                 # RAdam adjustment terms
                 p_inf = 2 / (1 - beta2) - 1
                 p_t = p_inf - 2 * t * beta2 ** t / (1 - beta2 ** t)
+                Rt = 10.0  # Default value
 
                 if p_t >= 5:
                     bt = ((1 - beta2 ** t) ** 0.5) / (1 - beta1 ** t)
                     rt = ((p_t - 4) * (p_t - 2) * p_inf) / ((p_inf - 4) * (p_inf - 2) * p_t)
                     Dtheta = rt * bt * (m_hat / (v_hat.sqrt() + eps)) + lambda_ * theta
+                    Rt = 1 / (rt * bt)
                 else:
-                    bt = 1 / (1 - beta1 ** t)
-                    Dtheta = bt * (m_hat / (v_hat.sqrt() + eps)) + lambda_ * theta
-
+                    use_radamw = (1 / t) * torch.sum(grad ** 2) <= 0.5 * ((1 - beta1) / (1 - beta2)) ** 2
+                    if use_radamw:
+                        bt = 1 / (1 - beta1 ** t)
+                        Dtheta = bt * (m_hat / (v_hat.sqrt() + eps)) + lambda_ * theta
+                    else:
+                        # Use degenerated RAdamW (not implemented in this basic version)
+                        Dtheta = grad
                 # Weight decay
                 if group['weight_decay'] != 0:
                     Dtheta.add_(p.data, alpha=group['weight_decay'])
@@ -92,15 +98,20 @@ class Paratrooper(Optimizer):
                 if omega == 0 or omega_dtheta == 0:
                     Tt = 1
                 else:
-                    Rt = 10
                     Tt = max(1, min(Rt, omega / omega_dtheta))
 
+                # Update theta
+                theta.add_(Dtheta, alpha=-lr * Tt)
                 # Update parameters
-                p.data.add_(Dtheta, alpha=-lr * Tt)
+                #p.data.add_(Dtheta, alpha=-lr * Tt)
 
                 if t % k == 0:
                     phi.mul_(mu).add_(theta, alpha=1 - mu)
-                    state['theta'] = phi.clone()
+                    theta.copy_(phi)
+                    #state['theta'] = phi.clone()
+                
+                # Update the parameter
+                p.data.copy_(theta)
 
         return loss
 
