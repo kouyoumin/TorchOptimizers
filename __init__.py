@@ -1,1 +1,1 @@
-from paratrooper import *
+from .paratrooper import *
