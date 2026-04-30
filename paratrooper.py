@@ -2,85 +2,42 @@ import torch
 import torch.optim as optim
 import math
 
+
 class Paratrooper(optim.Optimizer):
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0.01, # Default AdamW style weight decay
-                 # Lookahead parameters
+                 weight_decay=0.01,
                  lookahead_k=6,
                  lookahead_alpha=0.5,
-                 # Paratrooper LARS-like component parameters
                  use_lars=True,
-                 paratrooper_start_clip_val=10.0,
-                 paratrooper_end_clip_val=1.0,
-                 paratrooper_total_steps=10000, # Total training steps for decay schedule
-                 lars_epsilon=1e-8, # Epsilon for LARS trust ratio calculation
-                 lars_weight_decay=0.0 # Specific weight decay for LARS part if different
-                ):
-
+                 lars_epsilon=1e-8):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= eps:
-            raise ValueError(f"Invalid epsilon value: {eps}")
+            raise ValueError(f"Invalid epsilon: {eps}")
         if not 0.0 <= betas[0] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+            raise ValueError(f"Invalid beta[0]: {betas[0]}")
         if not 0.0 <= betas[1] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
-        if not 0.0 <= weight_decay: # General weight decay
-            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-        if not 0.0 <= lookahead_alpha <= 1.0:
-            raise ValueError(f"Invalid Lookahead alpha value: {lookahead_alpha}")
+            raise ValueError(f"Invalid beta[1]: {betas[1]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
         if not 1 <= lookahead_k:
-            raise ValueError(f"Invalid Lookahead k value: {lookahead_k}")
-        if not paratrooper_start_clip_val >= paratrooper_end_clip_val:
-            raise ValueError("paratrooper_start_clip_val must be >= paratrooper_end_clip_val")
-        if not paratrooper_total_steps > 0:
-            raise ValueError("paratrooper_total_steps must be positive for Paratrooper decay schedule")
-        if not 0.0 <= lars_weight_decay:
-            raise ValueError(f"Invalid LARS weight_decay value: {lars_weight_decay}")
-
+            raise ValueError(f"Invalid lookahead_k: {lookahead_k}")
+        if not 0.0 <= lookahead_alpha <= 1.0:
+            raise ValueError(f"Invalid lookahead_alpha: {lookahead_alpha}")
 
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
                         lookahead_k=lookahead_k, lookahead_alpha=lookahead_alpha,
-                        use_lars=use_lars,
-                        paratrooper_start_clip_val=paratrooper_start_clip_val,
-                        paratrooper_end_clip_val=paratrooper_end_clip_val,
-                        paratrooper_total_steps=paratrooper_total_steps,
-                        lars_epsilon=lars_epsilon,
-                        lars_weight_decay=lars_weight_decay)
+                        use_lars=use_lars, lars_epsilon=lars_epsilon)
+        super().__init__(params, defaults)
 
-        super(Paratrooper, self).__init__(params, defaults)
-
-        # Initialize RAdam as the fast optimizer
-        # If LARS is handling weight decay, RAdam should not apply it.
-        radam_weight_decay = 0.0 if use_lars else weight_decay
-        self.radam_optimizer = optim.RAdam(
-            self.param_groups, # RAdam will use the groups defined in Paratrooper
-            lr=lr,             # RAdam's LR, can be modulated effectively by LARS scaling
-            betas=betas,
-            eps=eps,
-            weight_decay=radam_weight_decay
-        )
-
-        # Lookahead state: store slow weights and RAdam's original parameters
-        # This might seem redundant as radam_optimizer uses self.param_groups,
-        # but Lookahead often conceptualizes operating on a copy.
-        # Here, self.param_groups ARE the 'fast' weights.
         for group in self.param_groups:
             group['lookahead_step_counter'] = 0
             for p in group['params']:
-                param_state = self.state[p]
-                param_state['slow_buffer'] = torch.clone(p.data).detach()
-
-        self.global_step = 0
-
-    def _get_current_paratrooper_clip_val(self, group):
-        start_val = group['paratrooper_start_clip_val']
-        end_val = group['paratrooper_end_clip_val']
-        # Ensure global_step doesn't exceed total_steps for calculation
-        progress = min(self.global_step / group['paratrooper_total_steps'], 1.0)
-        # Linear decay
-        current_clip_val = start_val - (start_val - end_val) * progress
-        return current_clip_val
+                state = self.state[p]
+                state['slow_buffer'] = p.data.clone().detach()
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p.data, dtype=torch.float32)
+                state['exp_avg_sq'] = torch.zeros_like(p.data, dtype=torch.float32)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -89,106 +46,82 @@ class Paratrooper(optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        self.global_step += 1
-
-        # LARS-like gradient scaling (Paratrooper modification)
-        # This happens BEFORE RAdam's step, by modifying p.grad in place
-        current_max_clip_for_lars = self._get_current_paratrooper_clip_val(self.param_groups[0]) # Assuming one group for clip schedule
-
         for group in self.param_groups:
-            if not group['use_lars']:
-                continue # Skip LARS-like scaling for this group
+            lr = group['lr']
+            beta1, beta2 = group['betas']
+            eps = group['eps']
+            wd = group['weight_decay']
+            use_lars = group['use_lars']
+            lars_eps = group['lars_epsilon']
+            p_inf = 2.0 / (1.0 - beta2) - 1.0
 
             for p in group['params']:
                 if p.grad is None:
                     continue
 
-                grad_data = p.grad.data
-                param_data = p.data
+                state = self.state[p]
+                state['step'] += 1
+                t = state['step']
 
-                # Effective weight decay for LARS component
-                lars_wd = group['lars_weight_decay']
+                grad = p.grad.data.float()
+                m = state['exp_avg']
+                v = state['exp_avg_sq']
 
-                # Create a temporary gradient for LARS processing (if WD is applied)
-                # This avoids modifying p.grad.data if WD is zero.
-                temp_grad = grad_data
-                if lars_wd > 0:
-                    temp_grad = grad_data.add(param_data, alpha=lars_wd)
+                # Moment update (pure loss gradient, no WD — decoupled style)
+                m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
-                weight_norm = torch.norm(param_data)
-                grad_norm = torch.norm(temp_grad)
+                beta2_t = beta2 ** t
+                beta1_t = beta1 ** t
+                p_t = p_inf - 2.0 * t * beta2_t / (1.0 - beta2_t)
 
-                trust_ratio = 1.0 # Default if norms are zero or LARS conditions not met
+                # Default clip for the degenerated (warm-up) regime
+                R_t = 10.0
 
-                if weight_norm > 0 and grad_norm > 0:
-                    lars_trust_raw = weight_norm / (grad_norm + group['lars_epsilon'])
-                    # Apply Paratrooper clipping to the LARS trust ratio
-                    trust_ratio = min(lars_trust_raw, current_max_clip_for_lars)
+                if p_t >= 5.0:
+                    # RAdam rectified regime
+                    b_t = math.sqrt(1.0 - beta2_t) / (1.0 - beta1_t)
+                    r_t = math.sqrt(
+                        (p_t - 4.0) * (p_t - 2.0) * p_inf /
+                        ((p_inf - 4.0) * (p_inf - 2.0) * p_t)
+                    )
+                    # RAdamW update: bias-corrected Adam + decoupled weight decay
+                    D_theta = (r_t * b_t) * m / (v.sqrt().add(eps))
+                    if wd != 0.0:
+                        D_theta = D_theta.add(p.data.float(), alpha=wd)
+                    # Paratrooper dynamic clip: starts large, decays toward 1
+                    R_t = 1.0 / (r_t * b_t)
+                else:
+                    # Degenerated regime: bias-corrected momentum only (no v)
+                    b_t = 1.0 / (1.0 - beta1_t)
+                    D_theta = b_t * m
+                    if wd != 0.0:
+                        D_theta = D_theta.add(p.data.float(), alpha=wd)
+                    # R_t stays at 10.0
 
-                # Scale the original gradient (p.grad.data) by this trust_ratio.
-                # If LARS weight decay was applied, temp_grad holds that.
-                # We want RAdam to see `trust_ratio * (original_grad + lars_wd * param)`
-                if lars_wd > 0:
-                    p.grad.data = temp_grad.mul_(trust_ratio)
-                else: # if lars_wd is 0, temp_grad is grad_data
-                    p.grad.data.mul_(trust_ratio)
+                # LARS trust ratio applied to Adam update D_theta (not raw grad)
+                if use_lars:
+                    w_norm = p.data.float().norm(2).item()
+                    d_norm = D_theta.norm(2).item()
+                    if w_norm == 0.0 or d_norm == 0.0:
+                        T_t = 1.0
+                    else:
+                        T_t = max(1.0, min(R_t, w_norm / (d_norm + lars_eps)))
+                else:
+                    T_t = 1.0
 
+                p.data.add_(D_theta.to(p.data.dtype), alpha=-lr * T_t)
 
-        # RAdam step (uses the potentially modified p.grad)
-        self.radam_optimizer.step()
-
-        # Lookahead update
+        # Lookahead: interpolate all params (not just those with gradients)
         for group in self.param_groups:
             group['lookahead_step_counter'] += 1
             if group['lookahead_step_counter'] >= group['lookahead_k']:
                 group['lookahead_step_counter'] = 0
                 alpha = group['lookahead_alpha']
                 for p in group['params']:
-                    if p.grad is None: # Should not happen if p was in radam_optimizer
-                        continue
-                    param_state = self.state[p]
-                    slow_p = param_state['slow_buffer']
-                    fast_p = p.data # p.data is now the result of RAdam's step (fast weights)
-
-                    slow_p.add_(fast_p - slow_p, alpha=alpha) # Update slow weights: slow += alpha * (fast - slow)
-                    fast_p.copy_(slow_p)                      # Copy slow weights back to fast weights
+                    state = self.state[p]
+                    slow_p = state['slow_buffer']
+                    slow_p.add_(p.data - slow_p, alpha=alpha)
+                    p.data.copy_(slow_p)
 
         return loss
-
-    def zero_grad(self, set_to_none: bool = False):
-        # Zero gradients for the main parameters
-        super(Paratrooper, self).zero_grad(set_to_none)
-        # RAdam internally refers to the same param_groups, so its grads are also zeroed.
-        # If RAdam had its own copy of params, we'd call self.radam_optimizer.zero_grad()
-        # but since it uses self.param_groups, this is sufficient.
-
-    def state_dict(self):
-        # Get base optimizer state (includes slow_buffers and lookahead_step_counters)
-        base_state_dict = super(Paratrooper, self).state_dict()
-        # Get RAdam's state
-        radam_state_dict = self.radam_optimizer.state_dict()
-
-        # Combine them
-        return {
-            "base_state": base_state_dict,
-            "radam_optimizer_state": radam_state_dict,
-            "global_step": self.global_step
-        }
-
-    def load_state_dict(self, state_dict):
-        # Load RAdam's state first
-        self.radam_optimizer.load_state_dict(state_dict["radam_optimizer_state"])
-        # Load base optimizer state (this will restore slow_buffers etc. into self.state)
-        super(Paratrooper, self).load_state_dict(state_dict["base_state"])
-        self.global_step = state_dict["global_step"]
-
-        # PyTorch optimizers (like RAdam) re-initialize their state for param_groups
-        # when load_state_dict is called, if the param_groups structure changed.
-        # We need to ensure self.param_groups are correctly configured before this.
-        # After RAdam's state is loaded, self.param_groups used by Paratrooper
-        # should align with what RAdam expects. Our structure where RAdam uses
-        # self.param_groups directly should simplify this.
-
-        # Important: Ensure that the `slow_buffer` is correctly associated.
-        # The base `load_state_dict` should handle restoring `self.state[p]['slow_buffer']`.
-        # And `self.radam_optimizer.param_groups` are the same objects as `self.param_groups`.
